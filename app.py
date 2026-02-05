@@ -71,16 +71,40 @@ def get_language_name(lang_code):
     lang_code = lang_code.lower().strip()
     return LANGUAGE_MAP.get(lang_code, lang_code.upper())
 
+# Reverse map for user-provided language names
+LANGUAGE_NAME_TO_CODE = {v.lower(): k for k, v in LANGUAGE_MAP.items()}
+
+def normalize_language_input(value):
+    """Normalize a user-provided language value to a display name and code."""
+    if not value:
+        return None, None
+    raw = str(value).strip()
+    if not raw:
+        return None, None
+    key = raw.lower()
+    if key in LANGUAGE_MAP:
+        return LANGUAGE_MAP[key], key
+    if key in LANGUAGE_NAME_TO_CODE:
+        code = LANGUAGE_NAME_TO_CODE[key]
+        return LANGUAGE_MAP.get(code, raw), code
+    if key in SUPPORTED_LANGUAGES:
+        return key.title(), None
+    return raw, None
+
 app = Flask(__name__)
 
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
+ENABLE_WHISPER = os.getenv("ENABLE_WHISPER", "").strip().lower() in {"1", "true", "yes"}
 DISABLE_WHISPER = os.getenv("DISABLE_WHISPER", "").strip().lower() in {"1", "true", "yes"}
+WHISPER_ENABLED = ENABLE_WHISPER and not DISABLE_WHISPER
 _whisper_model = None
 _whisper_load_failed = False
 
 def get_whisper_model():
     """Lazy-load Whisper to avoid startup OOM on small instances."""
     global _whisper_model, _whisper_load_failed
+    if not WHISPER_ENABLED:
+        raise RuntimeError("Whisper disabled")
     if _whisper_model is not None:
         return _whisper_model
     if _whisper_load_failed:
@@ -283,6 +307,9 @@ def detect():
 
         # Handle FormData, JSON base64, or audio URL
         data = request.get_json(silent=True) if request.is_json else None
+        requested_language = request.form.get("language") or request.args.get("language")
+        if not requested_language and isinstance(data, dict):
+            requested_language = data.get("language")
         audio_url = request.form.get("audio_url") or request.args.get("audio_url")
         if not audio_url and isinstance(data, dict):
             audio_url = data.get("audio_url")
@@ -378,17 +405,27 @@ def detect():
             sensitivity = 1.0
 
         # Prepare audio for Whisper (16 kHz mono float32). We already normalized.
-        try:
-            if DISABLE_WHISPER:
-                raise RuntimeError("Whisper disabled via DISABLE_WHISPER")
-            whisper_audio = y.astype(np.float32)
-            whisper_result = get_whisper_model().transcribe(whisper_audio, fp16=False, task="transcribe")
-            language_code = whisper_result.get("language", "unknown")
-            language = get_language_name(language_code)
-        except Exception as e:
-            print("Whisper transcription failed:", e)
+        if WHISPER_ENABLED:
+            try:
+                whisper_audio = y.astype(np.float32)
+                whisper_result = get_whisper_model().transcribe(whisper_audio, fp16=False, task="transcribe")
+                language_code = whisper_result.get("language", "unknown")
+                language = get_language_name(language_code)
+            except Exception as e:
+                print("Whisper transcription failed:", e)
+                language_code = "unknown"
+                language = "Unknown"
+        else:
             language_code = "unknown"
             language = "Unknown"
+
+        # If Whisper is disabled or fails, use user-provided language (optional)
+        if (language == "Unknown" or language_code == "unknown") and requested_language:
+            lang_display, lang_code_override = normalize_language_input(requested_language)
+            if lang_display:
+                language = lang_display
+            if lang_code_override:
+                language_code = lang_code_override
 
         # Language-aware sensitivity adjustments. Reduced to avoid false positives on human speech
         # Lower sensitivity multiplier = less strict thresholds = fewer AI-generated detections
