@@ -73,7 +73,24 @@ def get_language_name(lang_code):
 
 app = Flask(__name__)
 
-whisper_model = whisper.load_model("base")
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
+DISABLE_WHISPER = os.getenv("DISABLE_WHISPER", "").strip().lower() in {"1", "true", "yes"}
+_whisper_model = None
+_whisper_load_failed = False
+
+def get_whisper_model():
+    """Lazy-load Whisper to avoid startup OOM on small instances."""
+    global _whisper_model, _whisper_load_failed
+    if _whisper_model is not None:
+        return _whisper_model
+    if _whisper_load_failed:
+        raise RuntimeError("Whisper load previously failed")
+    try:
+        _whisper_model = whisper.load_model(WHISPER_MODEL_NAME)
+        return _whisper_model
+    except Exception:
+        _whisper_load_failed = True
+        raise
 
 # Try load trained model if present
 MODEL_PATH = Path("models/model.joblib")
@@ -362,9 +379,10 @@ def detect():
 
         # Prepare audio for Whisper (16 kHz mono float32). We already normalized.
         try:
+            if DISABLE_WHISPER:
+                raise RuntimeError("Whisper disabled via DISABLE_WHISPER")
             whisper_audio = y.astype(np.float32)
-
-            whisper_result = whisper_model.transcribe(whisper_audio, fp16=False, task="transcribe")
+            whisper_result = get_whisper_model().transcribe(whisper_audio, fp16=False, task="transcribe")
             language_code = whisper_result.get("language", "unknown")
             language = get_language_name(language_code)
         except Exception as e:
